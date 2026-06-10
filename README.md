@@ -1,8 +1,17 @@
 # autoblur
 
+![autoblur demo — original vs. blurred](samples/demo.gif)
+
+*The demo loops through each sample image and the version autoblur produced
+(1s per frame). The source images live in the [`samples/`](samples/) directory
+and were generated with **1-bit and Ternary Bonsai Image 4B** from
+[Prism ML](https://prismml.com/news/bonsai-image-4b).*
+
 Quick-and-dirty pre-sharing photo cleanup for macOS. Point it at a photo and it
 automatically blurs **text** (signs, addresses, names, account/license numbers,
-screens) and **faces** — no editing tool required.
+screens) and **faces** — no editing tool required. Hand it a single image, a
+batch of files, or a whole folder (optionally recursing into subfolders) and it
+cleans each one in place.
 
 Detection uses Apple's built-in **Vision** framework (runs on-device, no model
 downloads, no network). Blurring is done with Pillow using an irreversible
@@ -37,6 +46,8 @@ python3 -m venv .venv
 ./autoblur photo.jpg                  # blur both text and faces
 ./autoblur photo.jpg -o clean.jpg     # choose the output path
 ./autoblur *.jpg                      # batch process many files
+./autoblur ./photos                   # every image in a folder
+./autoblur ./photos -r                # ...and all its subfolders
 ./autoblur photo.jpg --faces-only     # faces only
 ./autoblur photo.jpg --text-only      # text only
 ./autoblur photo.jpg --preview        # draw detection boxes instead of blurring
@@ -44,14 +55,22 @@ python3 -m venv .venv
 ./autoblur photo.jpg --padding 0.1    # grow each region before blurring
 ```
 
-| Option         | Description                                                        |
-|----------------|--------------------------------------------------------------------|
-| `-o, --output` | Output path (single input only). Default `<name>_blurred<ext>`.    |
-| `--faces-only` | Blur faces only.                                                   |
-| `--text-only`  | Blur text only.                                                    |
-| `--preview`    | Draw red (text) / blue (face) boxes instead of blurring.           |
-| `--strength`   | Blur strength `0.2`–`0.7`; higher is blurrier. Default `0.45`.     |
-| `--padding`    | Extra padding around each region, as a fraction. Default `0.06`.   |
+You can mix files and folders in a single command. When an argument is a
+folder, autoblur scans it for images (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`,
+`.tif`, `.tiff`, `.webp`); add `-r/--recursive` to descend into subfolders.
+Each result is written as `<name>_blurred<ext>` next to its original, and
+autoblur skips files that already look like its own output, so re-running over
+a folder won't reprocess earlier results.
+
+| Option            | Description                                                        |
+|-------------------|--------------------------------------------------------------------|
+| `-o, --output`    | Output path (single image only). Default `<name>_blurred<ext>`.    |
+| `-r, --recursive` | Descend into subfolders when an input is a directory.              |
+| `--faces-only`    | Blur faces only.                                                   |
+| `--text-only`     | Blur text only.                                                    |
+| `--preview`       | Draw red (text) / blue (face) boxes instead of blurring.           |
+| `--strength`      | Blur strength `0.2`–`0.7`; higher is blurrier. Default `0.45`.     |
+| `--padding`       | Extra padding around each region, as a fraction. Default `0.06`.   |
 
 ## How it works
 

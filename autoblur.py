@@ -13,6 +13,8 @@ Usage:
     python autoblur.py photo.jpg
     python autoblur.py photo.jpg -o cleaned.jpg
     python autoblur.py *.jpg --faces-only
+    python autoblur.py ./photos                 # every image in a folder
+    python autoblur.py ./photos -r              # ...and all subfolders
     python autoblur.py photo.jpg --preview   # draw boxes instead of blurring
 
 By default writes "<name>_blurred<ext>" next to each input.
@@ -31,6 +33,18 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps
 import Quartz
 import Vision
 from Foundation import NSURL
+
+
+# Image formats we scan for inside directories. Explicitly-named files are
+# processed regardless of extension; this set only filters directory walks.
+IMAGE_EXTS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".gif",
+    ".tif", ".tiff", ".webp",
+}
+
+# Suffix tags autoblur appends to its own outputs. Files ending in these are
+# skipped during directory scans so repeated runs don't reprocess results.
+_OUTPUT_TAGS = ("_blurred", "_preview")
 
 
 class DetectionError(RuntimeError):
@@ -220,14 +234,68 @@ def _default_output(in_path: Path, preview: bool) -> Path:
     return in_path.with_name(f"{in_path.stem}{tag}{in_path.suffix}")
 
 
+def _looks_like_output(path: Path) -> bool:
+    """True if the filename looks like something autoblur previously wrote."""
+    return any(path.stem.endswith(tag) for tag in _OUTPUT_TAGS)
+
+
+def _iter_dir_images(directory: Path, recursive: bool):
+    """Yield image files inside a directory, sorted for deterministic order.
+
+    Filters by IMAGE_EXTS and skips autoblur's own outputs. Descends into
+    subfolders when recursive is True, otherwise only the top level.
+    """
+    pattern = "**/*" if recursive else "*"
+    for entry in sorted(directory.glob(pattern)):
+        if not entry.is_file():
+            continue
+        if entry.suffix.lower() not in IMAGE_EXTS:
+            continue
+        if _looks_like_output(entry):
+            continue
+        yield entry
+
+
+def _collect_inputs(paths, recursive: bool):
+    """Expand a mix of files and directories into a list of image files.
+
+    Returns (files, missing): de-duplicated image paths (order preserved) and
+    any paths that don't exist. Directories are scanned via _iter_dir_images;
+    explicitly-named files are kept as-is (no extension filtering).
+    """
+    files = []
+    missing = []
+    seen = set()
+
+    def add(path: Path):
+        key = path.resolve()
+        if key not in seen:
+            seen.add(key)
+            files.append(path)
+
+    for path in paths:
+        if not path.exists():
+            missing.append(path)
+        elif path.is_dir():
+            for img in _iter_dir_images(path, recursive):
+                add(img)
+        else:
+            add(path)
+
+    return files, missing
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="autoblur",
         description="Auto-blur faces and text in photos before sharing.",
     )
-    p.add_argument("images", nargs="+", type=Path, help="input image file(s)")
+    p.add_argument("images", nargs="+", type=Path,
+                   help="input image file(s) and/or director(ies)")
     p.add_argument("-o", "--output", type=Path,
-                   help="output path (only valid with a single input)")
+                   help="output path (only valid with a single input image)")
+    p.add_argument("-r", "--recursive", action="store_true",
+                   help="descend into subfolders when an input is a directory")
     p.add_argument("--faces-only", action="store_true", help="blur faces only")
     p.add_argument("--text-only", action="store_true", help="blur text only")
     p.add_argument("--preview", action="store_true",
@@ -241,19 +309,29 @@ def main(argv=None):
 
     if args.faces_only and args.text_only:
         p.error("--faces-only and --text-only are mutually exclusive")
-    if args.output and len(args.images) > 1:
-        p.error("-o/--output can only be used with a single input image")
+
+    # -o targets a single output file, so it only makes sense when the caller
+    # passes exactly one image file (not a directory that fans out to many).
+    if args.output:
+        if len(args.images) != 1 or args.images[0].is_dir():
+            p.error("-o/--output can only be used with a single input image")
 
     do_text = not args.faces_only
     do_faces = not args.text_only
 
-    exit_code = 0
-    for in_path in args.images:
-        if not in_path.exists():
-            print(f"skip: {in_path} (not found)", file=sys.stderr)
-            exit_code = 1
-            continue
+    files, missing = _collect_inputs(args.images, args.recursive)
 
+    exit_code = 0
+    for path in missing:
+        print(f"skip: {path} (not found)", file=sys.stderr)
+        exit_code = 1
+
+    if not files:
+        print("no image files to process", file=sys.stderr)
+        return exit_code or 1
+
+    ok_count = 0
+    for in_path in files:
         out_path = args.output or _default_output(in_path, args.preview)
         try:
             t, f = process_image(
@@ -267,9 +345,13 @@ def main(argv=None):
             exit_code = 1
             continue
 
+        ok_count += 1
         verb = "boxed" if args.preview else "blurred"
         print(f"{in_path.name}: {verb} {t} text region(s), {f} face(s) "
               f"-> {out_path}")
+
+    if len(files) > 1:
+        print(f"done: {ok_count}/{len(files)} image(s) processed")
 
     return exit_code
 
