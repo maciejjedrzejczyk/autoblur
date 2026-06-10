@@ -1,0 +1,26 @@
+# Python virtualenv & caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# This is a code repo — never commit photos or processed outputs.
+# (autoblur is a tool that operates on personal images.)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.heic
+*.heif
+*_blurred.*
+*_preview.*
+*_prev.*
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
