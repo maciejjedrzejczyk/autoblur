@@ -23,8 +23,15 @@ By default writes "<name>_blurred<ext>" next to each input.
 from __future__ import annotations
 
 import argparse
+import base64
+import io
+import json
+import os
 import sys
 import tempfile
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
@@ -49,6 +56,242 @@ _OUTPUT_TAGS = ("_blurred", "_preview")
 
 class DetectionError(RuntimeError):
     pass
+
+
+class VerificationError(RuntimeError):
+    """Raised when the optional vision-model verification pass fails."""
+
+
+# --- Optional vision-model verification ------------------------------------
+#
+# After the first (on-device Vision) blur pass, the result can optionally be
+# sent to a user-defined vision model for a second opinion: "is anything
+# sensitive still readable?" Any regions the model reports are re-blurred, and
+# the loop repeats until the model is satisfied or a pass cap is reached.
+#
+# The model is reached through an OpenAI-compatible /chat/completions endpoint,
+# which is the de-facto standard understood by OpenAI, Ollama, LM Studio,
+# OpenRouter, vLLM and most local servers. Only the Python standard library is
+# used for the call (no extra dependencies).
+
+_VERIFY_SYSTEM_PROMPT = (
+    "You are a privacy reviewer inspecting an image that has ALREADY had "
+    "sensitive regions pixelated/blurred. Your job is to find anything still "
+    "clearly readable or identifiable that a privacy-conscious person would "
+    "want hidden before sharing: legible text (names, addresses, account, "
+    "license or phone numbers, screens, signs) and recognizable human faces. "
+    "Ignore regions that are already blurred or pixelated."
+)
+
+_VERIFY_USER_PROMPT = (
+    "List every region that is NOT yet blurred but still shows sensitive text "
+    "or a recognizable face. Respond with ONLY a JSON object, no prose, no "
+    "markdown fences, in exactly this shape:\n"
+    '{"regions": [{"x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0, '
+    '"kind": "text", "reason": "..."}]}\n'
+    "Coordinates are the region's bounding box as fractions in [0,1] of image "
+    "width/height, with the ORIGIN AT THE TOP-LEFT: x,y is the top-left corner, "
+    "w,h are the width and height. \"kind\" is either \"text\" or \"face\". "
+    'If nothing sensitive remains visible, respond with {"regions": []}.'
+)
+
+
+@dataclass
+class VerifyConfig:
+    """Settings for the optional vision-model verification pass."""
+
+    model: str
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str | None = None
+    max_passes: int = 2
+    timeout: float = 120.0
+
+    @property
+    def endpoint(self) -> str:
+        return self.base_url.rstrip("/") + "/chat/completions"
+
+
+@dataclass
+class ProcessResult:
+    """Outcome of processing one image."""
+
+    text_count: int = 0
+    face_count: int = 0
+    verify_passes: int = 0       # number of model verification passes run
+    verify_reblurred: int = 0    # extra regions blurred during verification
+    verify_error: str | None = None  # non-fatal verification failure message
+    local_verify_passes: int = 0     # native (Vision) re-verify passes run
+    local_verify_reblurred: int = 0  # extra regions blurred by native re-verify
+
+
+def _encode_png_b64(img: Image.Image) -> str:
+    """Encode a PIL image as a base64 PNG data string (no data: prefix)."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _extract_json_object(text: str) -> dict:
+    """Best-effort parse of a JSON object out of a model's text response.
+
+    Tolerates markdown code fences and leading/trailing prose by falling back
+    to the substring between the first '{' and the last '}'.
+    """
+    text = (text or "").strip()
+    if text.startswith("```"):
+        # Strip a leading ```json / ``` fence and the trailing fence.
+        text = text.split("\n", 1)[-1] if "\n" in text else text
+        if text.endswith("```"):
+            text = text[: -3]
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+    raise VerificationError(
+        "could not parse JSON from model response: "
+        f"{text[:200]!r}"
+    )
+
+
+def _call_vision_model(cfg: VerifyConfig, img: Image.Image) -> list[dict]:
+    """Send the image to the configured model and return its raw regions list."""
+    data_url = "data:image/png;base64," + _encode_png_b64(img)
+    payload = {
+        "model": cfg.model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": _VERIFY_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _VERIFY_USER_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if cfg.api_key:
+        headers["Authorization"] = f"Bearer {cfg.api_key}"
+
+    req = urllib.request.Request(
+        cfg.endpoint, data=body, headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg.timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:300]
+        raise VerificationError(
+            f"model endpoint returned HTTP {e.code}: {detail}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise VerificationError(f"could not reach model endpoint: {e.reason}") from e
+
+    try:
+        parsed = json.loads(raw)
+        content = parsed["choices"][0]["message"]["content"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+        raise VerificationError(
+            f"unexpected response from model endpoint: {raw[:200]!r}"
+        ) from e
+
+    obj = _extract_json_object(content)
+    regions = obj.get("regions", [])
+    if not isinstance(regions, list):
+        raise VerificationError("model 'regions' field was not a list")
+    return regions
+
+
+def _verify_region_to_rect(region: dict, width: int, height: int, pad_frac: float):
+    """Convert a model region {x,y,w,h} (top-left) to a padded pixel rect.
+
+    Coordinates are expected normalized in [0,1]; as a safety net, if any value
+    looks like a raw pixel coordinate (>1), the whole box is treated as pixels.
+    Returns None if the region is malformed.
+    """
+    try:
+        x = float(region["x"])
+        y = float(region["y"])
+        w = float(region["w"])
+        h = float(region["h"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+
+    # Heuristic: some models return pixel coordinates despite instructions.
+    if max(x, y, w, h) > 1.5:
+        x, w = x / width, w / width
+        y, h = y / height, h / height
+
+    left = (x - w * pad_frac) * width
+    top = (y - h * pad_frac) * height
+    right = (x + w + w * pad_frac) * width
+    bottom = (y + h + h * pad_frac) * height
+
+    left = max(0, int(round(left)))
+    top = max(0, int(round(top)))
+    right = min(width, int(round(right)))
+    bottom = min(height, int(round(bottom)))
+    if right - left < 2 or bottom - top < 2:
+        return None
+    return left, top, right, bottom
+
+
+def verify_and_reblur(
+    img: Image.Image,
+    cfg: VerifyConfig,
+    pad_frac: float,
+    strength: float,
+) -> tuple[int, int]:
+    """Iteratively ask the model for leftover regions and re-blur them in place.
+
+    Returns (passes_run, regions_reblurred). Modifies img in place.
+    """
+    width, height = img.size
+    total_reblurred = 0
+    passes_run = 0
+
+    for _ in range(max(1, cfg.max_passes)):
+        passes_run += 1
+        regions = _call_vision_model(cfg, img)
+        if not regions:
+            break
+
+        reblurred_this_pass = 0
+        for region in regions:
+            rect = _verify_region_to_rect(region, width, height, pad_frac)
+            if rect is None:
+                continue
+            kind = str(region.get("kind", "text")).lower()
+            if kind == "face":
+                face_rect = _verify_region_to_rect(
+                    region, width, height, pad_frac + 0.12
+                ) or rect
+                _obscure_region(
+                    img, face_rect,
+                    cell_frac=max(0.05, strength * 0.28),
+                )
+            else:
+                _obscure_region(img, rect, cell_frac=strength)
+            reblurred_this_pass += 1
+
+        total_reblurred += reblurred_this_pass
+        if reblurred_this_pass == 0:
+            # Model reported regions but none were usable; stop to avoid looping.
+            break
+
+    return passes_run, total_reblurred
 
 
 def _cgimage_from_path(path: str):
@@ -174,6 +417,96 @@ def _obscure_region(img: Image.Image, rect, cell_frac: float):
     img.paste(region, rect)
 
 
+def _blur_boxes(img, text_boxes, face_boxes, pad_frac, strength):
+    """Mosaic-blur detected regions on img in place; return the pixel rects used.
+
+    Text lines are short and wide, so cells must be a big fraction of the line
+    height to destroy the glyphs. Faces are large, so a smaller cell fraction
+    gives a finer mosaic that is still unrecognizable but looks less like a
+    solid censor block; they also get extra padding to cover hair, chin, ears.
+    """
+    width, height = img.size
+    rects = []
+    for box in text_boxes:
+        rect = _to_pixel_rect(box, width, height, pad_frac)
+        _obscure_region(img, rect, cell_frac=strength)
+        rects.append(rect)
+    for box in face_boxes:
+        rect = _to_pixel_rect(box, width, height, pad_frac + 0.12)
+        _obscure_region(img, rect, cell_frac=max(0.05, strength * 0.28))
+        rects.append(rect)
+    return rects
+
+
+def _coverage_fraction(rect, others) -> float:
+    """Largest fraction of `rect`'s area covered by any single rect in others."""
+    ax0, ay0, ax1, ay1 = rect
+    area = max(1, (ax1 - ax0) * (ay1 - ay0))
+    best = 0.0
+    for bx0, by0, bx1, by1 in others:
+        iw = max(0, min(ax1, bx1) - max(ax0, bx0))
+        ih = max(0, min(ay1, by1) - max(ay0, by0))
+        if iw and ih:
+            best = max(best, (iw * ih) / area)
+    return best
+
+
+def verify_local_reblur(
+    img: Image.Image,
+    do_text: bool,
+    do_faces: bool,
+    pad_frac: float,
+    strength: float,
+    max_passes: int,
+    already_blurred,
+    cover_threshold: float = 0.8,
+) -> tuple[int, int]:
+    """Re-run on-device Vision on the blurred image and re-blur leftovers.
+
+    The first blur pass can miss regions (small/low-contrast text, a face the
+    detector skipped). Re-running Vision on the *output* surfaces anything that
+    survived. To avoid looping forever on the already-mosaicked blocks — which
+    Vision's region detector may still flag as "text" — each candidate is
+    skipped when it is mostly covered by a region we have already blurred
+    (>= cover_threshold of its area). The loop stops as soon as a pass finds no
+    genuinely new region, or when max_passes is reached.
+
+    Returns (passes_run, regions_reblurred). Modifies img in place.
+    """
+    width, height = img.size
+    covered = list(already_blurred)
+    passes_run = 0
+    total_reblurred = 0
+
+    for _ in range(max(1, max_passes)):
+        passes_run += 1
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
+            img.save(tmp.name)
+            text_boxes, face_boxes = detect_regions(tmp.name, do_text, do_faces)
+
+        new_this_pass = 0
+        for box in text_boxes:
+            rect = _to_pixel_rect(box, width, height, pad_frac)
+            if _coverage_fraction(rect, covered) >= cover_threshold:
+                continue
+            _obscure_region(img, rect, cell_frac=strength)
+            covered.append(rect)
+            new_this_pass += 1
+        for box in face_boxes:
+            rect = _to_pixel_rect(box, width, height, pad_frac + 0.12)
+            if _coverage_fraction(rect, covered) >= cover_threshold:
+                continue
+            _obscure_region(img, rect, cell_frac=max(0.05, strength * 0.28))
+            covered.append(rect)
+            new_this_pass += 1
+
+        total_reblurred += new_this_pass
+        if new_this_pass == 0:
+            break
+
+    return passes_run, total_reblurred
+
+
 def process_image(
     in_path: Path,
     out_path: Path,
@@ -182,10 +515,13 @@ def process_image(
     pad_frac: float = 0.06,
     strength: float = 0.45,
     preview: bool = False,
+    verify_cfg: "VerifyConfig | None" = None,
+    verify_local: bool = False,
+    verify_max_passes: int = 2,
 ):
     """Detect and blur sensitive regions, write the result to out_path.
 
-    Returns (text_count, face_count).
+    Returns a ProcessResult with detection counts and verification info.
     """
     # Open with Pillow and bake in EXIF orientation so pixel coordinates line
     # up with what Vision sees.
@@ -197,6 +533,7 @@ def process_image(
         img.save(tmp.name)
         text_boxes, face_boxes = detect_regions(tmp.name, do_text, do_faces)
 
+    blurred_rects = []
     if preview:
         draw = ImageDraw.Draw(img)
         for box in text_boxes:
@@ -206,27 +543,40 @@ def process_image(
             draw.rectangle(_to_pixel_rect(box, width, height, pad_frac),
                            outline=(60, 120, 255), width=max(2, width // 400))
     else:
-        # Text lines are short and wide: cells must be a big fraction of the
-        # line height to destroy the glyphs.
-        for box in text_boxes:
-            _obscure_region(img, _to_pixel_rect(box, width, height, pad_frac),
-                            cell_frac=strength)
-        # Faces are large; a smaller cell fraction gives a finer mosaic that is
-        # still unrecognizable but looks less like a solid censor block. They
-        # also get extra padding so hair, chin and ears are covered.
-        for box in face_boxes:
-            _obscure_region(
-                img,
-                _to_pixel_rect(box, width, height, pad_frac + 0.12),
-                cell_frac=max(0.05, strength * 0.28),
+        blurred_rects = _blur_boxes(img, text_boxes, face_boxes, pad_frac, strength)
+
+    result = ProcessResult(text_count=len(text_boxes), face_count=len(face_boxes))
+
+    # Optional native re-verification: re-run on-device Vision on the blurred
+    # image and re-blur anything that survived the first pass. Offline, free,
+    # deterministic. Only runs when we actually blurred (not in preview).
+    if verify_local and not preview:
+        passes, reblurred = verify_local_reblur(
+            img, do_text, do_faces, pad_frac, strength,
+            max_passes=verify_max_passes, already_blurred=blurred_rects,
+        )
+        result.local_verify_passes = passes
+        result.local_verify_reblurred = reblurred
+
+    # Optional second-opinion pass with a user-defined vision model. Only runs
+    # when we actually blurred (not in preview mode). A failure here must not
+    # discard the already-blurred first pass, so it's reported, not raised.
+    if verify_cfg is not None and not preview:
+        try:
+            passes, reblurred = verify_and_reblur(
+                img, verify_cfg, pad_frac, strength
             )
+            result.verify_passes = passes
+            result.verify_reblurred = reblurred
+        except VerificationError as e:
+            result.verify_error = str(e)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_kwargs = {}
     if out_path.suffix.lower() in (".jpg", ".jpeg"):
         save_kwargs["quality"] = 95
     img.save(out_path, **save_kwargs)
-    return len(text_boxes), len(face_boxes)
+    return result
 
 
 def _default_output(in_path: Path, preview: bool) -> Path:
@@ -305,10 +655,69 @@ def main(argv=None):
     p.add_argument("--padding", type=float, default=0.06,
                    help="extra padding around each region as a fraction "
                         "(default 0.06)")
+
+    # --- Optional vision-model verification pass ---------------------------
+    verify_group = p.add_argument_group(
+        "vision-model verification",
+        "Optionally re-check the blurred result and re-blur anything still "
+        "visible: --verify-local re-runs on-device Vision (offline, free), "
+        "and/or --verify-model uses a user-defined vision model (any "
+        "OpenAI-compatible endpoint). Both are ignored with --preview.",
+    )
+    verify_group.add_argument(
+        "--verify-local", action="store_true",
+        help="re-run on-device Apple Vision on the blurred image and re-blur "
+             "any text/face that survived the first pass (no network, no key)")
+    verify_group.add_argument(
+        "--verify", action="store_true",
+        help="after blurring, ask a vision model to find anything still "
+             "readable and re-blur it (requires --verify-model)")
+    verify_group.add_argument(
+        "--verify-model", metavar="NAME",
+        help="model name to use for verification, e.g. 'gpt-4o' or "
+             "'llama3.2-vision' (implies --verify)")
+    verify_group.add_argument(
+        "--verify-base-url", metavar="URL",
+        default=os.environ.get("AUTOBLUR_VERIFY_BASE_URL",
+                               "https://api.openai.com/v1"),
+        help="OpenAI-compatible API base URL (default OpenAI; or set "
+             "AUTOBLUR_VERIFY_BASE_URL). Use e.g. http://localhost:11434/v1 "
+             "for Ollama")
+    verify_group.add_argument(
+        "--verify-api-key-env", metavar="ENVVAR", default="OPENAI_API_KEY",
+        help="environment variable holding the API key for the verification "
+             "endpoint (default OPENAI_API_KEY; ignored if unset)")
+    verify_group.add_argument(
+        "--verify-max-passes", type=int, default=2, metavar="N",
+        help="max verify/re-blur iterations per image (default 2)")
     args = p.parse_args(argv)
 
     if args.faces_only and args.text_only:
         p.error("--faces-only and --text-only are mutually exclusive")
+
+    # --verify-model implies --verify; --verify alone needs a model.
+    model_verify_enabled = args.verify or bool(args.verify_model)
+    if model_verify_enabled and not args.verify_model:
+        p.error("--verify requires --verify-model NAME")
+
+    any_verify = model_verify_enabled or args.verify_local
+    if any_verify and args.verify_max_passes < 1:
+        p.error("--verify-max-passes must be at least 1")
+
+    verify_cfg = None
+    verify_local = False
+    if any_verify and args.preview:
+        print("note: --preview given; skipping verification", file=sys.stderr)
+    elif any_verify:
+        verify_local = args.verify_local
+        if model_verify_enabled:
+            api_key = os.environ.get(args.verify_api_key_env)
+            verify_cfg = VerifyConfig(
+                model=args.verify_model,
+                base_url=args.verify_base_url,
+                api_key=api_key,
+                max_passes=args.verify_max_passes,
+            )
 
     # -o targets a single output file, so it only makes sense when the caller
     # passes exactly one image file (not a directory that fans out to many).
@@ -334,11 +743,14 @@ def main(argv=None):
     for in_path in files:
         out_path = args.output or _default_output(in_path, args.preview)
         try:
-            t, f = process_image(
+            res = process_image(
                 in_path, out_path,
                 do_text=do_text, do_faces=do_faces,
                 pad_frac=args.padding, strength=args.strength,
                 preview=args.preview,
+                verify_cfg=verify_cfg,
+                verify_local=verify_local,
+                verify_max_passes=args.verify_max_passes,
             )
         except (DetectionError, OSError) as e:
             print(f"error: {in_path}: {e}", file=sys.stderr)
@@ -347,8 +759,20 @@ def main(argv=None):
 
         ok_count += 1
         verb = "boxed" if args.preview else "blurred"
-        print(f"{in_path.name}: {verb} {t} text region(s), {f} face(s) "
-              f"-> {out_path}")
+        msg = (f"{in_path.name}: {verb} {res.text_count} text region(s), "
+               f"{res.face_count} face(s)")
+        if res.local_verify_passes:
+            msg += (f"; local re-blurred {res.local_verify_reblurred} "
+                    f"region(s) over {res.local_verify_passes} pass(es)")
+        if res.verify_passes:
+            msg += (f"; model re-blurred {res.verify_reblurred} region(s) "
+                    f"over {res.verify_passes} pass(es)")
+        msg += f" -> {out_path}"
+        print(msg)
+        if res.verify_error:
+            print(f"  warning: verification skipped ({res.verify_error})",
+                  file=sys.stderr)
+            exit_code = 1
 
     if len(files) > 1:
         print(f"done: {ok_count}/{len(files)} image(s) processed")
